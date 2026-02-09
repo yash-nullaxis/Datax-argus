@@ -1,0 +1,40 @@
+# Argus SDK - Agno Implementation
+# Autonomous Business Intelligence Agent
+
+# Ignore compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Environment files
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+*.db

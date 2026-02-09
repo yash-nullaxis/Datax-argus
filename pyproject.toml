@@ -1,0 +1,35 @@
+[tool.poetry]
+name = "argus-sdk"
+version = "0.1.0"
+description = "Argus SDK: Autonomous Business Intelligence Agent using Agno framework for multi-source data connectivity and analysis."
+authors = ["Yash Somkuwar <yashsomkuwar@example.com>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/yashsomkuwar/researcher-agent"
+repository = "https://github.com/yashsomkuwar/researcher-agent"
+keywords = ["bi", "agent", "llm", "sql", "data-analysis", "agno"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+agno = "^1.0.0"
+pydantic = "^2.0.0"
+sqlglot = "^20.0.0"
+sqlalchemy = "^2.0.0"
+duckdb = "^1.0.0"
+pandas = "^2.0.0"
+python-dotenv = "^1.0.0"
+psycopg2-binary = "^2.9.0"
+pymongo = "^4.0.0"
+chromadb = "^0.4.0"
+openpyxl = "^3.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
