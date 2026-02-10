@@ -40,6 +40,11 @@ class AgentConfig(BaseModel):
     # Execution controls
     max_rows_per_query: Optional[int] = None
     max_retry_per_step: int = 3
+    
+    # Replanning controls
+    max_replan_attempts: int = 2  # How many times to replan after failures
+    replan_on_partial_failure: bool = True  # Replan even if some steps succeeded
+    replan_min_failure_ratio: float = 0.3  # Replan if >= 30% of steps failed
 
     # Logging / tracing
     verbose: bool = False

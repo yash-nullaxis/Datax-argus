@@ -2,10 +2,12 @@
 Orchestrator for the Argus Analysis Agent using Agno Workflow.
 
 This replaces the LangGraph-based orchestration with Agno's workflow system.
-The workflow follows a Planner -> Analyst -> Synthesizer pattern.
+The workflow follows a Planner -> Analyst -> Synthesizer pattern with
+dynamic replanning on failures.
 """
 import logging
-from typing import Dict, List, Optional, Any
+import re
+from typing import Dict, List, Optional, Any, Tuple
 
 from agno.agent import Agent
 from agno.workflow import Workflow
@@ -19,11 +21,62 @@ from .config import AgentConfig
 from .db.connector import DBConnector, DuckDBConnector, SqlAlchemyConnector
 from .models import get_agno_model
 from .safety import SQLValidator
-from .state import AnalysisContext, AnalysisStep, StepResult
+from .state import (
+    AnalysisContext, 
+    AnalysisStep, 
+    StepResult, 
+    ErrorCategory,
+    FailedApproach,
+    ReplanRequest,
+)
 from .synthesizer.memo import Synthesizer
 
 
 logger = logging.getLogger(__name__)
+
+
+def classify_error(error_message: str, query: str = "") -> Tuple[ErrorCategory, bool]:
+    """
+    Classify an error into a category and determine if it's recoverable.
+    
+    Returns: (ErrorCategory, is_recoverable)
+    """
+    if not error_message:
+        return ErrorCategory.UNKNOWN, True
+    
+    error_lower = error_message.lower()
+    
+    # Connection/permission errors (fatal)
+    if any(x in error_lower for x in ["connection refused", "could not connect", "timeout expired"]):
+        return ErrorCategory.CONNECTION_ERROR, False
+    
+    if any(x in error_lower for x in ["permission denied", "access denied", "not authorized"]):
+        return ErrorCategory.PERMISSION_ERROR, False
+    
+    if "security violation" in error_lower:
+        return ErrorCategory.SECURITY_VIOLATION, False
+    
+    # Schema errors (recoverable)
+    if any(x in error_lower for x in ["does not exist", "unknown table", "no such table", "relation"]):
+        if "table" in error_lower:
+            return ErrorCategory.SCHEMA_ERROR, True
+    
+    if any(x in error_lower for x in ["unknown column", "no such column", "column not found"]):
+        return ErrorCategory.SCHEMA_ERROR, True
+    
+    # Syntax errors (recoverable)
+    if any(x in error_lower for x in ["syntax error", "parse error", "unexpected token"]):
+        return ErrorCategory.SYNTAX_ERROR, True
+    
+    # Relevance errors (recoverable)
+    if "relevance" in error_lower or "not relevant" in error_lower:
+        return ErrorCategory.RELEVANCE_ERROR, True
+    
+    # Timeout (recoverable with simpler query)
+    if "timeout" in error_lower or "took too long" in error_lower:
+        return ErrorCategory.TIMEOUT_ERROR, True
+    
+    return ErrorCategory.UNKNOWN, True
 
 
 class PlannerAgent:
@@ -100,6 +153,57 @@ class PlannerAgent:
             debug_trace=debug_msgs,
         )
 
+    def replan(self, context: AnalysisContext) -> AnalysisContext:
+        """
+        Generate a new plan based on previous failures.
+        
+        This is the key method for dynamic replanning.
+        """
+        if self.config.verbose:
+            logger.info(f"[Planner] Replanning (attempt {context.replan_count + 1})...")
+            logger.info(f"[Planner] Failed approaches: {len(context.failed_approaches)}")
+        
+        # Build the replan request
+        replan_request = context.build_replan_request()
+        
+        # Get datasource hints
+        datasource_list = list(self.connectors.keys())
+        datasources = self.config.datasource_hints or {name: "" for name in datasource_list}
+        
+        # Generate new plan avoiding previous failures
+        new_steps = self.decomposer.replan(
+            request=replan_request,
+            schema_context=context.schema_summary,
+            datasources=datasources,
+        )
+        
+        if not new_steps:
+            # If replanning fails, create a minimal fallback
+            logger.warning("[Planner] Replanning produced no steps, using fallback")
+            new_steps = [
+                AnalysisStep(
+                    id=1000 + context.replan_count,  # High ID to avoid conflicts
+                    description=f"Alternative approach for: {context.user_query}",
+                    tool="sql",
+                    datasource=self.default_source,
+                    dependency=-1,
+                    thought="Fallback after replanning failure.",
+                    is_fallback=True,
+                )
+            ]
+        
+        # Update context with new plan
+        context.plan = new_steps
+        context.replan_count += 1
+        context.debug_trace.append(f"[Planner] Replan #{context.replan_count}: {len(new_steps)} steps")
+        
+        if self.config.verbose:
+            logger.info(f"[Planner] Replan generated {len(new_steps)} new steps")
+            for s in new_steps:
+                logger.info(f"  - [{s.id}] {s.description} (fallback: {s.is_fallback})")
+        
+        return context
+
 
 class AnalystAgent:
     """Agent responsible for executing analysis steps."""
@@ -145,7 +249,7 @@ class AnalystAgent:
         return str(dialect_name)
 
     def execute_step(self, step: AnalysisStep, context: AnalysisContext) -> StepResult:
-        """Execute a single analysis step."""
+        """Execute a single analysis step with enhanced error classification."""
         target_source = step.datasource or self.default_source
         if target_source not in self.connectors:
             target_source = self.default_source
@@ -159,6 +263,7 @@ class AnalystAgent:
             
             # Local Retry Loop for Robustness
             last_error = None
+            last_error_category = None
             for attempt in range(self.config.max_retry_per_step):
                 try:
                     if self.config.verbose:
@@ -192,11 +297,30 @@ class AnalystAgent:
                     
                     if not is_valid:
                         last_error = f"Validation Error: {error_msg}"
+                        last_error_category, _ = classify_error(error_msg, query)
                         debug_msgs.append(f"[Analyst] Validation failed: {error_msg}")
                         continue  # Retry
 
                     # Execute
                     result = self.executor.execute(query)
+                    
+                    # Check for empty results
+                    if not result or (isinstance(result, list) and len(result) == 0):
+                        last_error = "Query returned no results"
+                        last_error_category = ErrorCategory.EMPTY_RESULT
+                        debug_msgs.append("[Analyst] Empty result set")
+                        # Don't retry for empty results - might be legitimate
+                        # But flag it for potential replanning
+                        return StepResult(
+                            step_id=step.id,
+                            output=result,
+                            success=True,  # Technically succeeded
+                            query_executed=query,
+                            row_count=0,
+                            columns=[],
+                            error_category=ErrorCategory.EMPTY_RESULT,
+                            is_recoverable=True,
+                        )
                     
                     # Relevance Check
                     rel = self.relevance_checker.check_relevance(
@@ -205,6 +329,7 @@ class AnalystAgent:
                     
                     if not rel.is_relevant or rel.score < self.config.min_relevance_score:
                         last_error = f"Low relevance: {rel.reasoning}"
+                        last_error_category = ErrorCategory.RELEVANCE_ERROR
                         debug_msgs.append(f"[Analyst] Low relevance: {last_error}")
                         continue  # Retry
                         
@@ -223,21 +348,37 @@ class AnalystAgent:
 
                 except Exception as e:
                     last_error = str(e)
+                    last_error_category, is_recoverable = classify_error(str(e), "")
                     debug_msgs.append(f"[Analyst] Error attempt {attempt+1}: {e}")
+                    
+                    # If fatal error, don't retry
+                    if not is_recoverable:
+                        return StepResult(
+                            step_id=step.id,
+                            output=None,
+                            success=False,
+                            error=last_error,
+                            error_category=last_error_category,
+                            is_recoverable=False,
+                        )
             
             # Specific failure after retries
             return StepResult(
                 step_id=step.id,
                 output=None,
                 success=False,
-                error=last_error or "Max retries exceeded"
+                error=last_error or "Max retries exceeded",
+                error_category=last_error_category or ErrorCategory.UNKNOWN,
+                is_recoverable=True,  # Worth trying a different approach
             )
         else:
             return StepResult(
                 step_id=step.id,
                 output="Skipped non-SQL step",
                 success=False,
-                error="Unsupported tool"
+                error="Unsupported tool",
+                error_category=ErrorCategory.UNKNOWN,
+                is_recoverable=False,
             )
 
     def execute_all(self, context: AnalysisContext) -> AnalysisContext:
@@ -267,19 +408,28 @@ class AnalystAgent:
                     
                     if result.success:
                         completed_ids.add(step.id)
+                        # Store successful results for potential reuse
+                        context.successful_partial_results[step.id] = result.output
                     else:
                         failed_ids.add(step.id)
+                        # Convert to failed approach for replanning context
+                        failed_approach = result.to_failed_approach(step)
+                        context.failed_approaches.append(failed_approach)
                     
                     made_progress = True
                 elif step.dependency in failed_ids:
                     # Dependency failed, skip this step
-                    results.append(StepResult(
+                    result = StepResult(
                         step_id=step.id,
                         output=None,
                         success=False,
-                        error=f"Dependency step {step.dependency} failed"
-                    ))
+                        error=f"Dependency step {step.dependency} failed",
+                        error_category=ErrorCategory.UNKNOWN,
+                        is_recoverable=True,
+                    )
+                    results.append(result)
                     failed_ids.add(step.id)
+                    context.failed_approaches.append(result.to_failed_approach(step))
                     made_progress = True
             
             if not made_progress:
@@ -294,7 +444,8 @@ class Orchestrator:
     """
     Main orchestrator for the Argus Analysis Agent using Agno.
     
-    This orchestrates the Planner -> Analyst -> Synthesizer workflow.
+    This orchestrates the Planner -> Analyst -> Synthesizer workflow
+    with dynamic replanning on failures.
     """
     
     def __init__(
@@ -341,6 +492,84 @@ class Orchestrator:
             self.relevance_checker, self.connectors, self.default_source
         )
 
+    def _should_replan(self, context: AnalysisContext) -> bool:
+        """
+        Determine if replanning should be attempted.
+        
+        Considers:
+        - Remaining replan budget
+        - Failure ratio
+        - Whether errors are recoverable
+        - Whether partial success is acceptable
+        """
+        # Check replan budget
+        if context.replan_count >= self.config.max_replan_attempts:
+            if self.config.verbose:
+                logger.info("[Orchestrator] Replan budget exhausted")
+            return False
+        
+        # Check for fatal errors
+        if context.has_fatal_error():
+            if self.config.verbose:
+                logger.info("[Orchestrator] Fatal error detected, won't replan")
+            return False
+        
+        # Calculate failure ratio
+        total_steps = len(context.step_results)
+        if total_steps == 0:
+            return False
+        
+        failed_steps = len([r for r in context.step_results if not r.success])
+        failure_ratio = failed_steps / total_steps
+        
+        # Check if we have recoverable failures
+        recoverable_failures = context.get_recoverable_failures()
+        if not recoverable_failures:
+            if self.config.verbose:
+                logger.info("[Orchestrator] No recoverable failures")
+            return False
+        
+        # Decision logic
+        if failure_ratio >= 1.0:
+            # Complete failure - definitely replan
+            return True
+        
+        if self.config.replan_on_partial_failure:
+            if failure_ratio >= self.config.replan_min_failure_ratio:
+                return True
+        
+        return False
+
+    def _execute_with_replanning(self, context: AnalysisContext) -> AnalysisContext:
+        """
+        Execute the analysis plan with dynamic replanning on failures.
+        
+        This is the core replanning loop.
+        """
+        while True:
+            # Execute current plan
+            context = self.analyst.execute_all(context)
+            
+            # Check if replanning is needed
+            if not self._should_replan(context):
+                break
+            
+            if self.config.verbose:
+                failed_count = len([r for r in context.step_results if not r.success])
+                logger.info(f"[Orchestrator] {failed_count} steps failed, initiating replan...")
+            
+            # Clear step results for new plan (but keep failed_approaches)
+            context.step_results = []
+            
+            # Generate new plan
+            context = self.planner.replan(context)
+            
+            context.debug_trace.append(
+                f"[Orchestrator] Replanning iteration {context.replan_count}"
+            )
+        
+        return context
+
     async def run(self, query: str) -> Dict[str, Any]:
         """
         Main entry point to run the agent.
@@ -351,8 +580,8 @@ class Orchestrator:
         # Step 1: Planning
         context = self.planner.plan(query)
         
-        # Step 2: Analysis
-        context = self.analyst.execute_all(context)
+        # Step 2: Analysis with replanning
+        context = self._execute_with_replanning(context)
         
         # Step 3: Synthesis
         final_memo = await self.synthesizer.synthesize(context)
@@ -364,6 +593,8 @@ class Orchestrator:
             "step_results": [result.model_dump() for result in context.step_results],
             "final_memo": context.final_memo,
             "debug_trace": context.debug_trace,
+            "replan_count": context.replan_count,
+            "failed_approaches": [fa.model_dump() for fa in context.failed_approaches],
         }
 
     def run_sync(self, query: str) -> Dict[str, Any]:
@@ -376,8 +607,8 @@ class Orchestrator:
         # Step 1: Planning
         context = self.planner.plan(query)
         
-        # Step 2: Analysis
-        context = self.analyst.execute_all(context)
+        # Step 2: Analysis with replanning
+        context = self._execute_with_replanning(context)
         
         # Step 3: Synthesis
         final_memo = self.synthesizer.synthesize_sync(context)
@@ -389,6 +620,8 @@ class Orchestrator:
             "step_results": [result.model_dump() for result in context.step_results],
             "final_memo": context.final_memo,
             "debug_trace": context.debug_trace,
+            "replan_count": context.replan_count,
+            "failed_approaches": [fa.model_dump() for fa in context.failed_approaches],
         }
 
     async def stream_run(self, query: str):
@@ -401,8 +634,8 @@ class Orchestrator:
         # Step 1: Planning
         context = self.planner.plan(query)
         
-        # Step 2: Analysis
-        context = self.analyst.execute_all(context)
+        # Step 2: Analysis with replanning
+        context = self._execute_with_replanning(context)
         
         # Step 3: Streaming Synthesis
         results_summary = ""
@@ -419,6 +652,10 @@ class Orchestrator:
                 results_summary += f"Result: {res.output}\n\n"
             else:
                 results_summary += f"Error: {res.error}\n\n"
+
+        # Add replanning info to context
+        if context.replan_count > 0:
+            results_summary += f"\n[Note: Analysis required {context.replan_count} replan(s) to complete]\n"
 
         system_prompt = """You are an Executive Strategy Consultant. Write a final memo answering the user's original question based on the analysis results.
 

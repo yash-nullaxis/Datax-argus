@@ -71,7 +71,7 @@ async def main():
     # 4. Run Analysis
     # A generic query that works on any schema
     query = """
-    Show me the total number of flights for each month in 2025.
+    Do a rough analysis of the database and tell me what you find.
     """
     
     print(f"\n--- Running Postgres Verification with Gemini 2.0 Flash ---\nQuery: {query}")
@@ -91,86 +91,5 @@ async def main():
             traceback.print_exc()
 
 
-async def full_result_demo():
-    """Demonstrate getting full result without streaming."""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        print("Error: GOOGLE_API_KEY not found.")
-        return
-
-    config = AgentConfig(
-        model=ModelConfig(
-            provider="google",
-            model_name="gemini-2.0-flash",
-            api_key=SecretStr(api_key)
-        ),
-        db_connection_str=os.getenv(
-            "DATABASE_URL", 
-            "postgresql://postgres:0h5UPFxhRWUFwdwE@localhost:5432/postgres"
-        ),
-        verbose=True,
-        max_retry_per_step=3,
-        min_relevance_score=5,
-    )
-
-    orchestrator = Orchestrator(config)
-
-    query = "What is the total count of records in each table?"
-    print(f"\n{'='*60}")
-    print(f"Query: {query}")
-    print('='*60)
-
-    result = await orchestrator.run(query)
-    
-    print("\n--- PLAN ---")
-    for step in result["plan"]:
-        print(f"  [{step['id']}] {step['description']} (tool: {step['tool']})")
-    
-    print("\n--- RESULTS ---")
-    for step_result in result["step_results"]:
-        status = "✓" if step_result["success"] else "✗"
-        print(f"  {status} Step {step_result['step_id']}")
-        if step_result.get("query_executed"):
-            print(f"    SQL: {step_result['query_executed'][:100]}...")
-        if step_result.get("error"):
-            print(f"    Error: {step_result['error']}")
-    
-    print("\n--- FINAL MEMO ---")
-    print(result["final_memo"])
-
-
-def sync_demo():
-    """Demonstrate synchronous usage."""
-    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("Error: No API key found in environment.")
-        return
-
-    provider = "google" if os.getenv("GOOGLE_API_KEY") else "openai"
-    model_name = "gemini-2.0-flash" if provider == "google" else "gpt-4-turbo"
-
-    config = AgentConfig(
-        model=ModelConfig(
-            provider=provider,
-            model_name=model_name,
-            api_key=SecretStr(api_key)
-        ),
-        db_connection_str=os.getenv(
-            "DATABASE_URL", 
-            "postgresql://postgres:0h5UPFxhRWUFwdwE@localhost:5432/postgres"
-        ),
-        verbose=True,
-    )
-
-    orchestrator = Orchestrator(config)
-    
-    result = orchestrator.run_sync("What is the total count of records?")
-    print(result["final_memo"])
-
-
 if __name__ == "__main__":
-    # Choose which demo to run:
-    # asyncio.run(full_result_demo())  # Full result demo
-    # sync_demo()                       # Sync demo
-    
-    asyncio.run(main())  # Streaming demo (default)
+    asyncio.run(main())
