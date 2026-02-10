@@ -71,7 +71,11 @@ async def main():
     # 4. Run Analysis
     # A generic query that works on any schema
     query = """
-    Do a rough analysis of the database and tell me what you find.
+For following key routes, can you comapre frequency of Indigo, Air India and AIX for red eye flights. Red eye flights are departing between 10pm and 4am. Routes to be considered Del-BOM BOM-DEL BLR-DEL DEL-BLR BLR-BOM BOM-BLR Del-HYD HYD-DEL
+
+PLease share a table with following columns: Routes, Frequency of Air India, Air INdia express and Indigo
+
+
     """
     
     print(f"\n--- Running Postgres Verification with Gemini 2.0 Flash ---\nQuery: {query}")
